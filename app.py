@@ -2,6 +2,7 @@ import os
 import json
 import re
 import requests
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from google import genai
 from google.genai import types
@@ -89,7 +90,32 @@ DEFAULT_RESOURCE = {
     "url": "https://www.khanacademy.org/computing/computer-science"
 }
 
+# ── Error helpers ───────────────────────────────────────────────────
+def api_error_response(message, code=500):
+    return jsonify({
+        "error": {
+            "code": int(code),
+            "message": str(message).strip()
+        }
+    }), int(code)
 
+def gemini_error_response(exc, default_code=503):
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None) or default_code
+    try:
+        code = int(code)
+    except Exception:
+        code = default_code
+
+    msg = str(exc).strip() or "Gemini request failed"
+
+    return jsonify({
+        "error": {
+            "code": code,
+            "message": msg
+        }
+    }), code
+
+# ── Core logic ──────────────────────────────────────────────────────
 def assess_risk(student):
     failed = [c for c in student["courses"] if c["grade"] in AT_RISK_GRADES]
     gpa = float(student["gpa"])
@@ -184,7 +210,7 @@ def call_gemini(prompt):
 
 
 def parse_response(raw_text):
-    clean = raw_text.strip()
+    clean = (raw_text or "").strip()
     if clean.startswith("```"):
         parts = clean.split("```")
         if len(parts) >= 3:
@@ -206,7 +232,6 @@ def normalize_text(text):
 
 def is_allowed_domain(url):
     try:
-        from urllib.parse import urlparse
         hostname = urlparse(url).netloc.lower()
         return any(hostname == d or hostname.endswith("." + d) for d in ALLOWED_RESOURCE_DOMAINS)
     except Exception:
@@ -216,29 +241,35 @@ def is_allowed_domain(url):
 def verify_url(url, timeout=10):
     if not url or not is_allowed_domain(url):
         return False
+
     headers = {"User-Agent": "Mozilla/5.0"}
+
     try:
         resp = requests.head(url, allow_redirects=True, timeout=timeout, headers=headers)
         if 200 <= resp.status_code < 400:
             return True
     except Exception:
         pass
+
     try:
         resp = requests.get(url, allow_redirects=True, timeout=timeout, headers=headers, stream=True)
         if 200 <= resp.status_code < 400:
             return True
     except Exception:
         pass
+
     return False
 
 
 def get_resource_from_map(course_code, course_name):
     if course_code in RESOURCE_MAP_BY_CODE:
         return RESOURCE_MAP_BY_CODE[course_code]
+
     course_name_norm = normalize_text(course_name)
     for key, resource in RESOURCE_MAP_BY_TOPIC.items():
         if key in course_name_norm:
             return resource
+
     return None
 
 
@@ -274,14 +305,14 @@ def generate_resource_with_gemini(course_code, course_name, max_attempts=3):
     for _ in range(max_attempts):
         prompt = build_resource_prompt(course_code, course_name)
         raw = call_gemini(prompt)
-        try:
-            data = parse_response(raw)
-            title = (data.get("title") or "").strip()
-            url = (data.get("url") or "").strip()
-            if title and url and verify_url(url):
-                return {"title": title, "url": url}
-        except Exception:
-            pass
+        data = parse_response(raw)
+
+        title = (data.get("title") or "").strip()
+        url = (data.get("url") or "").strip()
+
+        if title and url and verify_url(url):
+            return {"title": title, "url": url}
+
     return None
 
 
@@ -322,13 +353,16 @@ def sanitize_result_structure(result):
         study_plan = rec.get("study_plan", [])
         if not isinstance(study_plan, list):
             study_plan = []
+
         study_plan = [str(x).strip() for x in study_plan if str(x).strip()][:4]
+
         while len(study_plan) < 4:
             study_plan.append(f"Week {len(study_plan)+1}: مراجعة أساسية")
+
         cleaned.append({
-            "course_code": rec.get("course_code", "").strip(),
-            "course_name": rec.get("course_name", "").strip(),
-            "grade": rec.get("grade", "").strip(),
+            "course_code": (rec.get("course_code") or "").strip(),
+            "course_name": (rec.get("course_name") or "").strip(),
+            "grade": (rec.get("grade") or "").strip(),
             "study_plan": study_plan
         })
 
@@ -339,6 +373,7 @@ def sanitize_result_structure(result):
 def analyze_one_student(student):
     risk_level, failed_courses = assess_risk(student)
     prompt = build_prompt(student, risk_level, failed_courses)
+
     raw = call_gemini(prompt)
     result = parse_response(raw)
 
@@ -374,7 +409,7 @@ def validate_student_payload(student):
 
     return True, "ok"
 
-
+# ── Routes ──────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
@@ -390,14 +425,18 @@ def analyze_student_api():
     data = request.get_json(silent=True)
 
     if not data:
-        return jsonify({"error": "Invalid or missing JSON body"}), 400
+        return api_error_response("Invalid or missing JSON body", 400)
 
     is_valid, message = validate_student_payload(data)
     if not is_valid:
-        return jsonify({"error": message}), 400
+        return api_error_response(message, 400)
 
     try:
         result = analyze_one_student(data)
         return jsonify(result), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return gemini_error_response(e)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
